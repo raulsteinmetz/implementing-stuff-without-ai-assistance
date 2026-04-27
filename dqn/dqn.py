@@ -1,23 +1,28 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.optim as optim
 import gymnasium as gym
 import copy
+from collections import deque
 
 
 # AGENT PARAMETERS
 HIDDEN_DIM = 32
 EPS_MIN = 0.001
-EPS_DECAY = 0.999
+EPS_DECAY = 0.9999
 MEM_SIZE = int(32000)
 BATCH_SIZE = int(64)
 LR = 0.001
+GAMMA = 0.99
+TARGET_UPDATE_FREQ = 512
+WARMUP_FOR = 2064
 
 # TRAINING PARAMETERS
-MAX_STEPS = 10000
+MAX_STEPS = 100000
 
 # OTHER CONFIGURATIONS
-verbose_every = 1000
+VERBOSE_EVERY = 1000
 
 
 class MLP(nn.Module):
@@ -37,7 +42,6 @@ class MLP(nn.Module):
 class Memory():
     ''' simple memory buffer'''
     def __init__(self, size, obs_space, act_space):
-
         self.pointer = 0
         self.size = size     
 
@@ -45,20 +49,24 @@ class Memory():
         self.acts = torch.zeros((size), dtype=torch.int)
         self.obs_s = torch.zeros((size, obs_space), dtype=torch.float32)
         self.rews = torch.zeros((size), dtype=torch.float32)
-        self.dones = torch.zeros((size), dtype=torch.bool)
+        self.terms = torch.zeros((size), dtype=torch.bool)
+        self.truns = torch.zeros((size), dtype=torch.bool)
 
-    def write(self, obs, act, rew, obs_, done):
+    def write(self, obs, act, rew, obs_, term, trun):
+        ''' adds one transition to memory '''
         i = self.pointer % self.size
 
         self.obss[i] = obs
         self.acts[i] = act
         self.obs_s[i] = obs_
         self.rews[i] = rew
-        self.dones[i] = done
+        self.terms[i] = term
+        self.truns[i] = trun
 
         self.pointer += 1
 
     def sample(self, batch_size):
+        ''' samples transitions from memory '''
         if self.pointer < batch_size:
             return None # not enough entries in the buffer
         
@@ -71,7 +79,8 @@ class Memory():
             self.acts[indices],
             self.rews[indices],
             self.obs_s[indices],
-            self.dones[indices]
+            self.terms[indices],
+            self.truns[indices]
         )
 
 
@@ -83,12 +92,14 @@ def get_env(id:str='CartPole-v1'):
     return env, act_space, obs_space
 
 
-def train(env, q, qt, mem, act_space):
-
+def train(env, q, qt, mem, opt, act_space):
+    ''' trains agent '''
     # control variables / bookkeeping
     n_steps = 0
     n_episodes = 0
     eps = 1.0
+    ep_reward_buffer = deque(maxlen=100)
+    current_reward_sum = 0
 
     # initial reset
     obs, _ = env.reset() # _ ignores info
@@ -102,11 +113,13 @@ def train(env, q, qt, mem, act_space):
             act = torch.randint(0, act_space, (1,)).item()
         else:
             # forward q_net
-            act = torch.argmax(q(torch.tensor(obs, dtype=torch.float32)))
+            with torch.no_grad():
+                act = torch.argmax(q(torch.tensor(obs, dtype=torch.float32)))
 
         # step
         obs_, rew, term, trun, _  = env.step(act.item() if type(act) != int else act) # _ ignores info
         done = term or trun
+        current_reward_sum += rew
 
         # buffer update
         mem.write(
@@ -114,12 +127,15 @@ def train(env, q, qt, mem, act_space):
             torch.tensor(act, dtype=torch.int), 
             torch.tensor(rew, dtype=torch.float32), 
             torch.tensor(obs_, dtype=torch.float32), 
-            torch.tensor(done, dtype=torch.bool)
+            torch.tensor(term, dtype=torch.bool),
+            torch.tensor(trun, dtype=torch.bool)
             )
 
         # episode end
         if done: # episode over
             n_episodes += 1
+            ep_reward_buffer.append(current_reward_sum)
+            current_reward_sum = 0
             obs, _ = env.reset() # _ ignores info
         else:
             obs = obs_
@@ -128,22 +144,42 @@ def train(env, q, qt, mem, act_space):
         eps = eps * EPS_DECAY if eps * EPS_DECAY > EPS_MIN else EPS_MIN
 
         # dqn learning
-        sample = mem.sample(BATCH_SIZE)
-        if sample is not None:
-            obss, acts, rews, obs_s, dones = sample
-            # I AM HERE
-            
+        if n_steps > WARMUP_FOR:
+            sample = mem.sample(BATCH_SIZE)
+            if sample is not None:
+                obss, acts, rews, obs_s, terms, truns = sample
+                # Q(s, a) = r * y * Q(s_, a_)
+                # 1. What does q think about the current observations and actions?
+                q_pred = q(obss).gather(1, acts.long().unsqueeze(1)).squeeze(1)
+
+                # 2. What is a better estimate?
+                with torch.no_grad():
+                    qt_next, _ = torch.max(qt(obs_s), dim=1)
+                    qt_better = rews + GAMMA * qt_next * (~terms)
+
+                # 3. Loss calculation
+                loss = F.smooth_l1_loss(q_pred, qt_better)
+                
+                # 4. update
+                opt.zero_grad()
+                loss.backward()
+                opt.step()
+
+            # qt update
+            if n_steps % TARGET_UPDATE_FREQ == 0:
+                qt.load_state_dict(q.state_dict())
+
         # bookkepping
         n_steps += 1
 
         # verbose
-        if n_steps % verbose_every == 0:
+        if n_steps % VERBOSE_EVERY == 0:
             print(f' Step: {n_steps}\n Episode: {n_episodes}\n \
-                  ...')
+                  Average reward: {sum(ep_reward_buffer) / len(ep_reward_buffer)}...')
             
 
 if __name__ == '__main__':
-    ''' creates environment, neural network, trains it, evals it'''
+    ''' creates environment, neural network, trains it '''
 
     # create env
     env, act_space, obs_space = get_env()
@@ -152,5 +188,6 @@ if __name__ == '__main__':
     q = MLP(obs_space, act_space)
     qt = copy.deepcopy(q)
     mem = Memory(MEM_SIZE, obs_space, act_space)
+    opt = optim.Adam(q.parameters(), lr=LR)
 
-    train(env, q, qt, mem, act_space)
+    train(env, q, qt, mem, opt, act_space)
