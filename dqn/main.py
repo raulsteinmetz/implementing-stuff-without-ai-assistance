@@ -1,3 +1,9 @@
+'''
+    Simple Deep Q-Network implementation by raulsteinmetz
+    Obs: This code runs in cpu, and the run is not deterministic (I did not seed it)
+'''
+
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -5,6 +11,7 @@ import torch.optim as optim
 import gymnasium as gym
 import copy
 from collections import deque
+from matplotlib import pyplot as plt
 
 
 # AGENT PARAMETERS
@@ -19,7 +26,7 @@ TARGET_UPDATE_FREQ = 512
 WARMUP_FOR = 2064
 
 # TRAINING PARAMETERS
-MAX_STEPS = 100000
+MAX_STEPS = 200000
 
 # OTHER CONFIGURATIONS
 VERBOSE_EVERY = 1000
@@ -100,6 +107,7 @@ def train(env, q, qt, mem, opt, act_space):
     eps = 1.0
     ep_reward_buffer = deque(maxlen=100)
     current_reward_sum = 0
+    reward_moving_average = []
 
     # initial reset
     obs, _ = env.reset() # _ ignores info
@@ -137,6 +145,7 @@ def train(env, q, qt, mem, opt, act_space):
             ep_reward_buffer.append(current_reward_sum)
             current_reward_sum = 0
             obs, _ = env.reset() # _ ignores info
+            reward_moving_average.append(sum(ep_reward_buffer) / len(ep_reward_buffer)) # for plotting later
         else:
             obs = obs_
 
@@ -177,6 +186,8 @@ def train(env, q, qt, mem, opt, act_space):
             print(f' Step: {n_steps}\n Episode: {n_episodes}\n \
                   Average reward: {sum(ep_reward_buffer) / len(ep_reward_buffer)}...')
             
+    return reward_moving_average
+            
 
 if __name__ == '__main__':
     ''' creates environment, neural network, trains it '''
@@ -190,4 +201,10 @@ if __name__ == '__main__':
     mem = Memory(MEM_SIZE, obs_space, act_space)
     opt = optim.Adam(q.parameters(), lr=LR)
 
-    train(env, q, qt, mem, opt, act_space)
+    # train
+    reward_moving_average = train(env, q, qt, mem, opt, act_space)
+
+    # plot reward curve
+    plt.plot(reward_moving_average)
+    plt.savefig('reward_curve.png')
+    
