@@ -217,5 +217,4 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
-dqn-cartpole/venv
-ppo-mujoco/venv
+venv/
